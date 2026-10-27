@@ -186,3 +186,32 @@ class MediaIconButton(QWidget):
             path.lineTo(cx + 2.5, cy)
             path.lineTo(cx - 2.0, cy + 4.5)
             painter.drawPath(path)
+
+        elif self.icon_type == "pin":
+            # Apple-style pin icon (Toggle stay-open / pin)
+            if self.is_active:
+                pin_color = QColor(255, 255, 255, 255)
+            else:
+                pin_color = QColor(255, 255, 255, 140 if self.is_hovered else 80)
+
+            pen = QPen(pin_color, 1.3)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(pin_color if self.is_active else Qt.BrushStyle.NoBrush)
+
+            pin_path = QPainterPath()
+            # Top cap
+            pin_path.moveTo(cx - 3.5, cy - 5.0)
+            pin_path.lineTo(cx + 3.5, cy - 5.0)
+            # Tapered body
+            pin_path.lineTo(cx + 2.0, cy - 1.0)
+            pin_path.lineTo(cx + 4.0, cy + 1.0)
+            pin_path.lineTo(cx - 4.0, cy + 1.0)
+            pin_path.lineTo(cx - 2.0, cy - 1.0)
+            pin_path.closeSubpath()
+            painter.drawPath(pin_path)
+
+            # Pin needle
+            painter.drawLine(QPointF(cx, cy + 1.0), QPointF(cx, cy + 6.0))
+

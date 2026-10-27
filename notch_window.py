@@ -53,6 +53,7 @@ class LivingNotch(QWidget):
     def __init__(self):
         super().__init__()
         self.is_expanded = False
+        self.is_pinned = False  # Status kunci notch agar tetap terbuka (stay open)
         self.active_mode = "music"  # 'music' (Gambar 1) atau 'lyrics' (Gambar 2)
         self.last_position = 0.0
         self.track_duration = 210.0
@@ -73,15 +74,17 @@ class LivingNotch(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
-        # Kunci posisi di tengah atas layar monitor utama
-        screen_x, screen_w = self._get_screen_geometry()
-        win_x = screen_x + (screen_w - CANVAS_W) // 2
-        self.setGeometry(win_x, 0, CANVAS_W, CANVAS_H)
-
+        # Inisialisasi UI dan animasi terlebih dahulu
+        self.setFixedSize(CANVAS_W, CANVAS_H)
         self._init_ui()
         self._init_animations()
         self._init_timers()
+
+        # Setup layar & penempatan posisi presisi di tengah layar (Multi-Screen & Dynamic DPI Aware)
+        self._setup_screen_handling()
+        self._reposition_center()
         self._update_mask_and_layout()
 
         # Inisialisasi Background Media Worker
@@ -122,18 +125,73 @@ class LivingNotch(QWidget):
         self._morph_progress = val
         self.update()
 
-    def _get_screen_geometry(self):
+    def _setup_screen_handling(self):
+        """Memonitor perubahan topologi layar, multi-monitor, dan DPI secara dinamis."""
+        app = QApplication.instance()
+        if app:
+            app.primaryScreenChanged.connect(self._on_screen_topology_changed)
+            app.screenAdded.connect(self._on_screen_topology_changed)
+            app.screenRemoved.connect(self._on_screen_topology_changed)
+
+        self._bind_all_screens()
+
+    def _bind_all_screens(self):
+        """Hubungkan listener ke setiap monitor yang terdaftar."""
+        for scr in QApplication.screens():
+            try:
+                scr.geometryChanged.disconnect(self._on_screen_topology_changed)
+            except Exception:
+                pass
+            try:
+                scr.logicalDotsPerInchChanged.disconnect(self._on_screen_topology_changed)
+            except Exception:
+                pass
+            scr.geometryChanged.connect(self._on_screen_topology_changed)
+            scr.logicalDotsPerInchChanged.connect(self._on_screen_topology_changed)
+
+    def _on_screen_topology_changed(self, *args):
+        """Dipanggil saat monitor dicolok/dicabut atau resolusi layar berganti."""
+        self._bind_all_screens()
+        # Reposisi segera dan ulangi bertahap (multi-pass)
+        # karena Windows OS butuh waktu beberapa ms untuk menstabilkan DWM desktop
+        self._reposition_center()
+        QTimer.singleShot(100, self._reposition_center)
+        QTimer.singleShot(300, self._reposition_center)
+        QTimer.singleShot(700, self._reposition_center)
+        QTimer.singleShot(1500, self._reposition_center)
+
+    def _reposition_center(self, *args):
+        """Kalkulasi posisi tepat di tengah horizontal monitor (Responsive Centering)."""
         screen = QApplication.primaryScreen()
-        if screen:
-            geom = screen.geometry()
-            return geom.x(), geom.width()
-        return 0, 1920
+        if not screen:
+            screens = QApplication.screens()
+            if screens:
+                screen = screens[0]
+        if not screen:
+            return
+
+        handle = self.windowHandle()
+        if handle and handle.screen() != screen:
+            handle.setScreen(screen)
+
+        geom = screen.geometry()
+        self.setFixedSize(CANVAS_W, CANVAS_H)
+
+        win_x = geom.x() + (geom.width() - CANVAS_W) // 2
+        win_y = geom.y()
+        self.move(win_x, win_y)
+
+        self._update_mask_and_layout()
+        self.update()
 
     def _get_pill_rect(self) -> QRectF:
-        x = (CANVAS_W - self._notch_w) / 2.0
+        """Kalkulasi bentuk kapsul notch selalu tepat di tengah kanvas jendela."""
+        x = (float(self.width()) - self._notch_w) / 2.0
         return QRectF(x, 0.0, self._notch_w, self._notch_h)
 
     def _update_mask_and_layout(self):
+        if not hasattr(self, "inner_container"):
+            return
         rect = self._get_pill_rect()
         ear = EAR_RADIUS
 
@@ -142,13 +200,19 @@ class LivingNotch(QWidget):
         inner_h = int(rect.height() - 4)
         self.inner_container.setGeometry(inner_x, 3, max(100, inner_w), max(24, inner_h))
 
-        mask_rect = QRect(
-            int(rect.x()),
-            0,
-            int(rect.width()),
-            int(rect.height() + 4),
-        )
-        self.setMask(QRegion(mask_rect))
+        # OPTIMASI ULTRA-SMOOTH:
+        # Jangan panggil self.setMask() setiap frame tick animasi karena memicu
+        # overhead berat dan micro-stutter pada Windows DWM. setMask ditangani
+        # saat mulai dan selesai animasi di _animate_size & _on_animation_finished.
+        is_animating = hasattr(self, "anim_group") and self.anim_group.state() == QParallelAnimationGroup.State.Running
+        if not is_animating:
+            mask_rect = QRect(
+                int(rect.x()),
+                0,
+                int(rect.width()),
+                int(rect.height() + 4),
+            )
+            self.setMask(QRegion(mask_rect))
 
     def _init_ui(self):
         self.inner_container = QWidget(self)
@@ -159,16 +223,22 @@ class LivingNotch(QWidget):
         self.root_layout.setSpacing(4)
 
         # =====================================================================
-        # 1. HEADER ATAS (Ring Baterai • % Baterai • Tanggal & Jam • Waveform)
+        # 1. HEADER ATAS (Sisi Kiri: Baterai | Tengah: Jam Center | Sisi Kanan: Pin & Waveform)
         # =====================================================================
         self.header_bar = QHBoxLayout()
         self.header_bar.setContentsMargins(2, 0, 2, 0)
-        self.header_bar.setSpacing(6)
+        self.header_bar.setSpacing(0)
+
+        # --- Sisi Kiri: Baterai (Lebar Tetap 56px agar Jam Presisi di Center) ---
+        left_widget = QWidget(self)
+        left_box = QHBoxLayout(left_widget)
+        left_box.setContentsMargins(0, 0, 0, 0)
+        left_box.setSpacing(4)
 
         # Diagram Lingkaran Baterai
         self.status_ring = StatusRingWidget(self)
         self.status_ring.battery_changed.connect(self._on_battery_changed)
-        self.header_bar.addWidget(self.status_ring)
+        left_box.addWidget(self.status_ring)
 
         # Label Angka Persentase Baterai Real-time
         self.battery_label = QLabel(f"{self.status_ring.percent}%")
@@ -176,22 +246,39 @@ class LivingNotch(QWidget):
         self.battery_label.setStyleSheet(f"""
             color: rgba(255, 255, 255, 0.65);
             font-family: {FONT_FAMILY};
-            padding-right: 4px;
         """)
-        self.header_bar.addWidget(self.battery_label)
+        left_box.addWidget(self.battery_label)
+        left_box.addStretch()
+        left_widget.setFixedWidth(56)
+        self.header_bar.addWidget(left_widget)
 
-        # Tanggal & Jam
+        # --- Sisi Tengah: Tanggal & Jam (Presisi Dead-Center) ---
         self.header_date_time = QLabel("Mon 26 Oct 2026  <b>14:09</b>")
         self.header_date_time.setFont(QFont("Segoe UI", 9))
+        self.header_date_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.header_date_time.setStyleSheet(f"""
             color: #FFFFFF;
             font-family: {FONT_FAMILY};
         """)
-        self.header_bar.addWidget(self.header_date_time)
-        self.header_bar.addStretch()
+        self.header_bar.addWidget(self.header_date_time, stretch=1)
+
+        # --- Sisi Kanan: Pin & Waveform (Lebar Sama Persis 56px untuk Keseimbangan Simetris) ---
+        right_widget = QWidget(self)
+        right_box = QHBoxLayout(right_widget)
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.setSpacing(6)
+        right_box.addStretch()
+
+        # Tombol Pin (Stay Open Indicator & Toggle)
+        self.btn_pin = MediaIconButton("pin", size=18, parent=self)
+        self.btn_pin.setToolTip("Kunci Notch Tetap Terbuka (Stay Open)")
+        self.btn_pin.clicked.connect(self._toggle_pin)
+        right_box.addWidget(self.btn_pin)
 
         self.waveform = AppleWaveform(self)
-        self.header_bar.addWidget(self.waveform)
+        right_box.addWidget(self.waveform)
+        right_widget.setFixedWidth(56)
+        self.header_bar.addWidget(right_widget)
 
         self.root_layout.addLayout(self.header_bar)
 
@@ -432,23 +519,30 @@ class LivingNotch(QWidget):
         self.anim_group.addAnimation(self.anim_opacity)
         self.anim_group.finished.connect(self._on_animation_finished)
 
-    def _animate_size(self, target_w: float, target_h: float, duration: int = 300):
+    def _animate_size(self, target_w: float, target_h: float, duration: int = 280):
         self.anim_group.stop()
-        spring_curve = QEasingCurve(QEasingCurve.Type.OutBack)
-        spring_curve.setOvershoot(0.65)
+
+        # Set transition mask yang mencakup area target & awal agar tidak terpotong selama animasi
+        max_w = max(self._notch_w, target_w)
+        max_h = max(self._notch_h, target_h)
+        trans_x = int((self.width() - max_w) / 2.0)
+        self.setMask(QRegion(trans_x - 12, 0, int(max_w) + 24, int(max_h) + 20))
+
+        # Kurva Apple-style fluid cubic curve: sangat halus, tanpa stutter atau lonjakan liar
+        fluid_curve = QEasingCurve(QEasingCurve.Type.OutCubic)
 
         self.anim_w.setDuration(duration)
-        self.anim_w.setEasingCurve(spring_curve)
+        self.anim_w.setEasingCurve(fluid_curve)
         self.anim_w.setStartValue(self._notch_w)
         self.anim_w.setEndValue(target_w)
 
-        self.anim_h.setDuration(int(duration * 0.9))
-        self.anim_h.setEasingCurve(QEasingCurve.Type.OutQuint)
+        self.anim_h.setDuration(duration)
+        self.anim_h.setEasingCurve(fluid_curve)
         self.anim_h.setStartValue(self._notch_h)
         self.anim_h.setEndValue(target_h)
 
-        self.anim_morph.setDuration(int(duration * 0.9))
-        self.anim_morph.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.anim_morph.setDuration(duration)
+        self.anim_morph.setEasingCurve(fluid_curve)
         self.anim_morph.setStartValue(self._morph_progress)
         self.anim_morph.setEndValue(1.0 if self.is_expanded else 0.0)
 
@@ -468,6 +562,24 @@ class LivingNotch(QWidget):
         self.collapse_timer = QTimer(self)
         self.collapse_timer.setSingleShot(True)
         self.collapse_timer.timeout.connect(self._collapse_notch)
+
+        # Anti-Stuck Watchdog: memeriksa posisi cursor secara berkala
+        # agar notch tidak pernah macet terbuka jika mouse keluar dengan cepat atau OS kehilangan event
+        self.watchdog_timer = QTimer(self)
+        self.watchdog_timer.setInterval(120)
+        self.watchdog_timer.timeout.connect(self._watchdog_check)
+        self.watchdog_timer.start()
+
+    def _watchdog_check(self):
+        """Safety watchdog: memastikan notch tidak stuck dalam kondisi terbuka jika hover drop."""
+        if self.is_expanded and not self.is_pinned:
+            global_pos = QCursor.pos()
+            local_pos = self.mapFromGlobal(global_pos)
+            pill = self._get_pill_rect()
+            # Jika cursor tidak lagi berada di area kapsul notch (dengan margin toleransi 6px)
+            if not pill.adjusted(-6, -6, 6, 6).contains(QPointF(local_pos)):
+                if not self.collapse_timer.isActive():
+                    self.collapse_timer.start(140)
 
     @staticmethod
     def _fmt_time(seconds: float) -> str:
@@ -535,14 +647,42 @@ class LivingNotch(QWidget):
         self.m1_art.set_artwork(img_bytes, self.current_title)
         self.m2_art.set_artwork(img_bytes, self.current_title)
 
+    def _toggle_pin(self):
+        """Kunci notch agar tetap terbuka (stay open), atau lepaskan kunci untuk kembali ke semula."""
+        self.is_pinned = not self.is_pinned
+        self.btn_pin.set_active(self.is_pinned)
+
+        if self.is_pinned:
+            self.collapse_timer.stop()
+            if not self.is_expanded or self._notch_h < (MUSIC_H - 12):
+                self._expand_notch()
+        else:
+            # Jika kunci dilepas (diklik kembali), notch langsung kembali semula (compact)
+            self._collapse_notch(force=True)
+
+    def mousePressEvent(self, event):
+        """Klik pada area notch untuk mengunci (stay open) atau mengembalikan ke bentuk semula."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            local_pos = event.position()
+            if self._get_pill_rect().contains(local_pos):
+                child = self.childAt(event.pos())
+                # Hanya tangkap klik pada background, label, atau notch container
+                # (Biarkan tombol kontrol media, slider scrubber, dan arrow menjalankan aksinya sendiri)
+                if child in (None, self, self.inner_container, self.music_page, self.lyrics_page, self.stack_container) or isinstance(child, QLabel):
+                    self._toggle_pin()
+                    return
+        super().mousePressEvent(event)
+
     def enterEvent(self, event):
         self.collapse_timer.stop()
-        if not self.is_expanded:
+        if not self.is_expanded or self._notch_h < (MUSIC_H - 12):
             self._expand_notch()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.collapse_timer.start(240)
+        # Jika notch sedang dikunci (pinned), jangan collapse saat mouse pergi
+        if not self.is_pinned:
+            self.collapse_timer.start(180)
         super().leaveEvent(event)
 
     def _expand_notch(self):
@@ -550,22 +690,37 @@ class LivingNotch(QWidget):
         self.stack_container.show()
         target_w = LYRICS_W if self.active_mode == "lyrics" else MUSIC_W
         target_h = LYRICS_H if self.active_mode == "lyrics" else MUSIC_H
-        self._animate_size(target_w, target_h, 320)
+        self._animate_size(target_w, target_h, 280)
         self._update_clock()
 
-    def _collapse_notch(self):
+    def _collapse_notch(self, force: bool = False):
+        if self.is_pinned and not force:
+            return
+
         if self.is_expanded:
-            local_pos = self.mapFromGlobal(QCursor.pos())
-            if self._get_pill_rect().contains(QPointF(local_pos)):
-                return
+            if not force:
+                global_pos = QCursor.pos()
+                local_pos = self.mapFromGlobal(global_pos)
+                if self._get_pill_rect().adjusted(-2, -2, 2, 2).contains(QPointF(local_pos)):
+                    return
 
             self.is_expanded = False
-            self._animate_size(COMPACT_W, COMPACT_H, 260)
+            self._animate_size(COMPACT_W, COMPACT_H, 250)
             self._update_clock()
 
     def _on_animation_finished(self):
         if not self.is_expanded:
             self.stack_container.hide()
+
+        # Terapkan mask presisi (tight mask) setelah animasi selesai
+        rect = self._get_pill_rect()
+        mask_rect = QRect(
+            int(rect.x()),
+            0,
+            int(rect.width()),
+            int(rect.height() + 4),
+        )
+        self.setMask(QRegion(mask_rect))
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -588,6 +743,10 @@ class LivingNotch(QWidget):
             }}
         """)
 
+        pin_label = "Lepas Kunci Notch (Unpin)" if self.is_pinned else "Kunci Notch Terbuka (Pin)"
+        toggle_pin_action = QAction(pin_label, self)
+        toggle_pin_action.triggered.connect(self._toggle_pin)
+
         toggle_view_action = QAction("Ganti Tampilan (Musik / Lirik)", self)
         toggle_view_action.triggered.connect(self._toggle_mode)
 
@@ -597,6 +756,7 @@ class LivingNotch(QWidget):
         quit_action = QAction("Keluar dari Nusa", self)
         quit_action.triggered.connect(QApplication.instance().quit)
 
+        menu.addAction(toggle_pin_action)
         menu.addAction(toggle_view_action)
         menu.addAction(reset_sync_action)
         menu.addSeparator()
@@ -664,25 +824,7 @@ class LivingNotch(QWidget):
             amb_grad.setColorAt(1.0, QColor(123, 75, 255, 14))
             painter.fillPath(main_path, amb_grad)
 
-        # 4. Lubang Kamera & Indikator LED di Bezel Tengah Atas
-        cam_cx = x + w / 2.0
-        cam_cy = 13.0
-
-        # Lensa Kamera Mini
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(18, 20, 28, 200))
-        painter.drawEllipse(QPointF(cam_cx, cam_cy), 3.0, 3.0)
-
-        # Pantulan biru gelap lensa
-        painter.setBrush(QColor(30, 58, 138, 160))
-        painter.drawEllipse(QPointF(cam_cx, cam_cy), 1.8, 1.8)
-
-        # Titik LED Hijau saat Musik Aktif
-        if self.is_playing:
-            painter.setBrush(QColor(51, 224, 122, 230))
-            painter.drawEllipse(QPointF(cam_cx + 10.0, cam_cy), 1.5, 1.5)
-
-        # 5. Rim Light Kaca Tipis (1px Border Translucent khas Nusa)
+        # 4. Rim Light Kaca Tipis (1px Border Translucent khas Nusa)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         rim_grad = QLinearGradient(x, 0.0, x, h)
         rim_grad.setColorAt(0.0, QColor(255, 255, 255, 0))
